@@ -1,0 +1,39 @@
+name: Nightshift
+description: Find unattended agents that act as the company when no one is on shift.
+author: Nightshift
+branding:
+  icon: moon
+  color: yellow
+inputs:
+  path:
+    description: Repository path to scan
+    required: false
+    default: ${{ github.workspace }}
+  fail-on:
+    description: Lowest severity that fails the job (critical, high, medium)
+    required: false
+    default: high
+  sarif:
+    description: SARIF output path
+    required: false
+    default: nightshift.sarif
+  baseline:
+    description: Optional baseline file of known fingerprints
+    required: false
+    default: ""
+  consulting-url:
+    description: Footer CTA URL for the 90-minute review
+    required: false
+    default: ""
+outputs:
+  sarif:
+    description: Path to the SARIF file
+  critical:
+    description: Critical finding count
+  high:
+    description: High finding count
+  medium:
+    description: Medium finding count
+runs:
+  using: node20
+  main: dist/action.cjs
