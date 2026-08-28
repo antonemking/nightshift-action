@@ -1,0 +1,47 @@
+name: Seed public Action
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  seed:
+    if: github.repository == 'antonemking/nightshift-action'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Add Nightshift 0.1.1 action.cjs, tag, and remove this workflow
+        run: |
+          set -euo pipefail
+          expected=e0bb6516b6c260ce928a5d07469a7199635991c4
+          if [ -f dist/action.cjs ]; then
+            actual=$(git hash-object dist/action.cjs)
+            test "$actual" = "$expected"
+            echo "dist/action.cjs already present and matches 0.1.1"
+            git rm -f .github/workflows/seed-action.yml
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "Remove one-shot seed workflow."
+            git push origin HEAD:main
+            exit 0
+          fi
+          npm pack @getnightshift/cli@0.1.1
+          tar -xzf getnightshift-cli-0.1.1.tgz
+          mkdir -p dist
+          cp package/dist/action.cjs dist/action.cjs
+          rm -rf package getnightshift-cli-0.1.1.tgz
+          actual=$(git hash-object dist/action.cjs)
+          test "$actual" = "$expected"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dist/action.cjs
+          git rm -f .github/workflows/seed-action.yml
+          git commit -m "Add Nightshift 0.1.1 Action entrypoint."
+          git tag v0.1.1
+          git tag v1
+          git push origin HEAD:main
+          git push origin v0.1.1 v1
