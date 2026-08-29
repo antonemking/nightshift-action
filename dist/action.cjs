@@ -32913,7 +32913,7 @@ var SECURITY_REVIEW_ACTIONS = [
   "anthropics/claude-code-security-review"
 ];
 var AGENT_CLIS = [
-  /\bclaude-code\b/,
+  /\bclaude-code\b(?!-)/,
   /(?:^|[;|&\s/`"[])claude(?:\s+-[A-Za-z]|\s+--|\s+"|\s+'|$|[\]"])/,
   /\bcursor-agent\b/,
   /(?:^|[;|&\s/`"[])cursor(?:\s+-[A-Za-z]|\s+--|\s+"|\s+'|$|[\]"])/,
@@ -32988,8 +32988,14 @@ var CONTAINMENT_MARKERS = [
   /\bdeny[-_]?egress\b/i,
   /\bdeny[-_]?net\b/i,
   /\bno[-_]?egress\b/i,
-  /\bsandbox:\s*(true|deny)/i,
-  /\bruntime:\s*gvisor/i
+  /\bsandbox:\s*(?:agent:\s*)?(true|deny|awf)\b/i,
+  /\bruntime:\s*gvisor/i,
+  /\bgh-aw-firewall\b/i,
+  /\bsafe[-_]?outputs\b/i,
+  /\bGH_AW_SAFE_OUTPUTS\b/,
+  /\bgh-aw\/sandbox\b/i,
+  /\bsudo\s+awf\b/i,
+  /\bawf\s+--/
 ];
 var SECRET_TOKEN_KEYS = [
   /^(GH_TOKEN|GITHUB_TOKEN|GH_PAT|PAT|PERSONAL_ACCESS_TOKEN|APP_TOKEN|GH_APP_TOKEN)$/i,
@@ -33108,6 +33114,9 @@ function isDefaultGithubToken(value) {
   return DEFAULT_TOKEN_VALUES.some(
     (candidate) => candidate.replace(/\s/g, "").toLowerCase() === compact
   );
+}
+function isGithubTokenAlias(key) {
+  return /^(GH_TOKEN|GITHUB_TOKEN)$/i.test(key);
 }
 
 // src/engine/discover.ts
@@ -33753,21 +33762,27 @@ function writeLevelFromScopes(scopes, writeAll, extraSecrets) {
     )
   );
   const hasPrWrite = scopes.includes("pull-requests");
+  const hasIssuesWrite = scopes.includes("issues");
   if (hasRepoWrite) {
     return "repo-write";
   }
   if (hasPrWrite) {
     return "pr-only";
   }
+  if (hasIssuesWrite) {
+    return "issues-only";
+  }
   return "none";
 }
 function buildWriteSignal(input) {
   const extraSecrets = input.extraSecrets;
+  const defaultTokenKeys = input.defaultTokenKeys ?? [];
   if (input.permissions === "write-all") {
     return {
       level: "write-all",
       scopes: ["write-all"],
       extraSecrets,
+      defaultTokenKeys,
       missingPermissions: false
     };
   }
@@ -33776,6 +33791,7 @@ function buildWriteSignal(input) {
       level: extraSecrets.length > 0 ? "secret-token" : "none",
       scopes: ["read-all"],
       extraSecrets,
+      defaultTokenKeys,
       missingPermissions: false
     };
   }
@@ -33790,6 +33806,7 @@ function buildWriteSignal(input) {
       level: writeLevelFromScopes(scopes, false, extraSecrets),
       scopes,
       extraSecrets,
+      defaultTokenKeys,
       missingPermissions: false
     };
   }
@@ -33799,6 +33816,7 @@ function buildWriteSignal(input) {
       level: "secret-token",
       scopes: [],
       extraSecrets,
+      defaultTokenKeys,
       missingPermissions: missing
     };
   }
@@ -33807,6 +33825,7 @@ function buildWriteSignal(input) {
       level: "repo-write",
       scopes: ["contents"],
       extraSecrets,
+      defaultTokenKeys,
       missingPermissions: true
     };
   }
@@ -33814,6 +33833,7 @@ function buildWriteSignal(input) {
     level: "none",
     scopes: [],
     extraSecrets,
+    defaultTokenKeys,
     missingPermissions: missing
   };
 }
@@ -33836,23 +33856,37 @@ function isCompanyAsActor(triggers, write, injection, options) {
   return false;
 }
 function hasWrite(write) {
-  return write.level !== "none";
+  return write.level !== "none" || write.defaultTokenKeys.length > 0;
 }
 function hasFatWrite(write) {
   return write.level === "repo-write" || write.level === "write-all" || write.level === "secret-token";
 }
+function hasRepoOrPrWrite(write) {
+  return hasFatWrite(write) || write.level === "pr-only";
+}
+function hasPromptWrite(write) {
+  return hasRepoOrPrWrite(write) || write.level === "issues-only";
+}
+function isTokenHandoff(write) {
+  return write.defaultTokenKeys.length > 0 || write.level === "issues-only";
+}
 function fingerprintOf(path, jobId, ruleId, actor) {
   return (0, import_node_crypto.createHash)("sha256").update(`${path}|${jobId}|${ruleId}|${actor}`).digest("hex").slice(0, 16);
 }
-function titleFor(severity, write, injection, containment) {
+function titleFor(signals, severity) {
+  const write = signals.write;
+  const injection = signals.injection !== null;
+  if (injection && hasPromptWrite(write)) {
+    return signals.containment === "none" && severity === "critical" ? "unattended agent interpolates untrusted text into a write-capable job with no containment" : "unattended agent interpolates untrusted text into a write-capable job";
+  }
   if (severity === "critical") {
-    return containment === "none" ? "unattended agent with write token and no containment" : "unattended agent with write token";
+    return signals.containment === "none" ? "unattended agent with write token and no containment" : "unattended agent with write token";
+  }
+  if (isTokenHandoff(write) && !hasRepoOrPrWrite(write) && !injection) {
+    return "report-only agent is handed a GitHub token";
   }
   if (write.level === "pr-only" && !injection) {
     return "agent may open PRs without a sandbox";
-  }
-  if (injection && hasFatWrite(write)) {
-    return "unattended agent interpolates untrusted text into a write-capable job";
   }
   if (hasFatWrite(write)) {
     return "unattended agent with write token";
@@ -33866,11 +33900,20 @@ function writePhrase(signals) {
   if (signals.write.level === "write-all") {
     return "and has `permissions: write-all`";
   }
-  if (signals.write.scopes.length > 0) {
+  if (hasRepoOrPrWrite(signals.write) && signals.write.scopes.length > 0) {
     return `and has \`${signals.write.scopes.join(": write, ")}: write\``;
   }
   if (signals.write.extraSecrets.length > 0) {
     return `and passes ${signals.write.extraSecrets.join(", ")} into the agent step`;
+  }
+  if (signals.write.defaultTokenKeys.length > 0) {
+    return `and passes ${signals.write.defaultTokenKeys.join(", ")} into the agent step`;
+  }
+  if (signals.write.level === "issues-only") {
+    return "and has `issues: write`";
+  }
+  if (signals.write.scopes.length > 0) {
+    return `and has \`${signals.write.scopes.join(": write, ")}: write\``;
   }
   return "and the token posture is unclear";
 }
@@ -33884,15 +33927,37 @@ function messageFor(signals) {
   return `This ${signals.sourceKind.replace("-", " ")} ${parts.join(", ")}.`;
 }
 function controlCloser(signals) {
-  const declared = [
-    signals.containment === "declared" ? "a sandbox is declared, not verified" : null,
-    signals.humanGate === "declared" ? "a human gate is declared (environment or mention-if), not verified" : null
-  ].filter((part) => Boolean(part));
-  if (declared.length > 0) {
-    return `${declared.join(", and ")}. The company token still sits next to untrusted text.`;
+  const injection = signals.injection !== null;
+  if (injection && hasPromptWrite(signals.write)) {
+    const declared = [
+      signals.containment === "declared" ? "a sandbox is declared, not verified" : null,
+      signals.humanGate === "declared" ? "a human gate is declared (environment or mention-if), not verified" : null
+    ].filter((part) => Boolean(part));
+    if (declared.length > 0) {
+      return `${declared.join(", and ")}. The company token still sits next to untrusted text.`;
+    }
+    return "A malicious or confused ticket can become a PR as the company. There is no human and no sandbox.";
+  }
+  if (isTokenHandoff(signals.write) && !hasRepoOrPrWrite(signals.write) && !injection) {
+    return "Passing GH_TOKEN into a report-only or workflow_dispatch agent is inventory, not a weekend writer.";
+  }
+  if (signals.companyAsActor && hasRepoOrPrWrite(signals.write) && signals.containment === "none" && !injection) {
+    if (signals.humanGate === "declared") {
+      return "A human gate is declared (environment or mention-if), not verified. There is still no sandbox, and the job can write as the company while no one is on shift.";
+    }
+    return "There is no human and no sandbox. The job can write as the company while no one is on shift.";
+  }
+  if (signals.containment === "declared" && !injection) {
+    return "A sandbox is declared, not verified. Keep this on the inventory; default fail-on high does not page it.";
+  }
+  if (signals.humanGate === "declared" && !injection) {
+    return "A human gate is declared (environment or mention-if), not verified. Keep this on the inventory.";
   }
   if (signals.containment === "verified" && signals.humanGate === "verified") {
     return "Verified containment and a verified human gate are present; keep this on the inventory.";
+  }
+  if (!injection) {
+    return "There is no human and no sandbox. The job can write as the company while no one is on shift.";
   }
   return "A malicious or confused ticket can become a PR as the company. There is no human and no sandbox.";
 }
@@ -33912,8 +33977,11 @@ function scoreSignals(signals) {
   const unattended = signals.companyAsActor;
   const noContainment = signals.containment === "none";
   const noGate = signals.humanGate === "none";
+  const declaredContainment = signals.containment === "declared" || signals.containment === "verified";
   const verifiedControls = signals.containment === "verified" && signals.humanGate === "verified";
-  if (signals.sourceKind === "workflow" && !unattended && write.level === "none" && !injection) {
+  const pullRequestTarget = signals.triggers.includes("pull_request_target");
+  const tokenHandoff = isTokenHandoff(write);
+  if (signals.sourceKind === "workflow" && !unattended && write.level === "none" && write.defaultTokenKeys.length === 0 && !injection) {
     return null;
   }
   if (signals.sourceKind === "composite-action" && !unattended && !hasFatWrite(write) && !injection) {
@@ -33932,12 +34000,21 @@ function scoreSignals(signals) {
   } else if (signals.securityReviewLike && write.level === "pr-only" && !signals.scheduled && !injection && write.extraSecrets.length === 0) {
     severity = "medium";
     id = RULE_IDS.securityReview;
-  } else if (unattended && hasFatWrite(write) && (noContainment || noGate || injection)) {
-    severity = "high";
-    id = injection ? RULE_IDS.injection : RULE_IDS.unattendedWrite;
-  } else if (unattended && write.level === "pr-only" && injection) {
+  } else if (injection && hasPromptWrite(write)) {
     severity = "high";
     id = RULE_IDS.injection;
+  } else if (pullRequestTarget && hasRepoOrPrWrite(write)) {
+    severity = "high";
+    id = RULE_IDS.unattendedWrite;
+  } else if (unattended && hasRepoOrPrWrite(write) && noContainment) {
+    severity = "high";
+    id = RULE_IDS.unattendedWrite;
+  } else if (unattended && hasRepoOrPrWrite(write) && declaredContainment && !injection) {
+    severity = "medium";
+    id = RULE_IDS.noContainment;
+  } else if (unattended && tokenHandoff && !hasRepoOrPrWrite(write) && !injection) {
+    severity = "medium";
+    id = RULE_IDS.unattendedWrite;
   } else if (unattended && hasFatWrite(write)) {
     severity = "high";
     id = RULE_IDS.unattendedWrite;
@@ -33950,7 +34027,7 @@ function scoreSignals(signals) {
   } else if (signals.sourceKind === "crontab" && signals.actor) {
     severity = "high";
     id = RULE_IDS.crontab;
-  } else if (unattended && injection && write.level === "none") {
+  } else if (unattended && injection && !hasPromptWrite(write)) {
     severity = "medium";
     id = RULE_IDS.injection;
   } else if (!unattended && write.level === "pr-only") {
@@ -33960,6 +34037,9 @@ function scoreSignals(signals) {
     severity = "high";
     id = RULE_IDS.injection;
   } else if (!unattended && hasFatWrite(write)) {
+    severity = "medium";
+    id = RULE_IDS.unattendedWrite;
+  } else if (!unattended && tokenHandoff) {
     severity = "medium";
     id = RULE_IDS.unattendedWrite;
   }
@@ -33980,7 +34060,7 @@ function scoreSignals(signals) {
     line: signals.annotationLine,
     endLine: signals.annotationLine,
     jobId: signals.jobId,
-    title: titleFor(severity, write, injection, signals.containment),
+    title: titleFor(signals, severity),
     message: staffParagraph(signals),
     why: WHY,
     remediations: REMEDIATIONS,
@@ -34022,10 +34102,11 @@ var SEVERITY_RANK = {
 };
 var WRITE_RANK = {
   none: 0,
-  "pr-only": 1,
-  "repo-write": 2,
-  "secret-token": 3,
-  "write-all": 4
+  "issues-only": 1,
+  "pr-only": 2,
+  "repo-write": 3,
+  "secret-token": 4,
+  "write-all": 5
 };
 var CONTROL_RANK = {
   none: 0,
@@ -34277,18 +34358,23 @@ function resolveWrapperActor(input) {
 }
 
 // src/engine/scan.ts
-function extraSecretsFromEnv(env) {
-  const secrets = [];
+function classifyTokenEnv(env) {
+  const extraSecrets = [];
+  const defaultTokenKeys = [];
   for (const [key, value] of Object.entries(env)) {
     if (!looksLikeSecretTokenKey(key)) {
       continue;
     }
-    if (key.toUpperCase() === "GITHUB_TOKEN" && isDefaultGithubToken(value)) {
+    if (isGithubTokenAlias(key) && isDefaultGithubToken(value)) {
+      defaultTokenKeys.push(key);
       continue;
     }
-    secrets.push(key);
+    extraSecrets.push(key);
   }
-  return secrets;
+  return { extraSecrets, defaultTokenKeys };
+}
+function extraSecretsFromEnv(env) {
+  return classifyTokenEnv(env).extraSecrets;
 }
 function mergePermissions(workflow, job) {
   if (job !== void 0 && job !== null) {
@@ -34296,8 +34382,8 @@ function mergePermissions(workflow, job) {
   }
   return workflow;
 }
-function collectStepSecrets(workflow, job, step) {
-  return extraSecretsFromEnv({
+function collectStepTokens(workflow, job, step) {
+  return classifyTokenEnv({
     ...workflow.env,
     ...job.env,
     ...step.env,
@@ -34439,10 +34525,11 @@ function analyzeWorkflow(workflow, root, repoRoot, extraActors) {
       continue;
     }
     for (const target of actorSteps) {
-      const secrets = collectStepSecrets(workflow, job, target.step);
+      const tokens = collectStepTokens(workflow, job, target.step);
       const write = buildWriteSignal({
         permissions: mergePermissions(workflow.permissions, job.permissions),
-        extraSecrets: secrets,
+        extraSecrets: tokens.extraSecrets,
+        defaultTokenKeys: tokens.defaultTokenKeys,
         unattended
       });
       const injection = findInjection(
@@ -34483,7 +34570,7 @@ function analyzeDockerfile(path, content, repoRoot, extraActors = []) {
   if (!actorCommand) {
     return [];
   }
-  const secrets = extraSecretsFromEnv(docker.env);
+  const tokens = classifyTokenEnv(docker.env);
   const containment = fileContainsContainment(content);
   const signals = makeSignals({
     sourceKind: "dockerfile",
@@ -34495,7 +34582,11 @@ function analyzeDockerfile(path, content, repoRoot, extraActors = []) {
       line: actorCommand.line
     },
     triggers: ["schedule"],
-    write: buildWriteSignal({ permissions: void 0, extraSecrets: secrets }),
+    write: buildWriteSignal({
+      permissions: void 0,
+      extraSecrets: tokens.extraSecrets,
+      defaultTokenKeys: tokens.defaultTokenKeys
+    }),
     injection: findInjection(content),
     containment: declaredControl(containment),
     containmentEvidence: containment,
@@ -34637,7 +34728,7 @@ function sarifLevel(severity) {
   }
   return "warning";
 }
-function toSarif(result, version = "0.1.1") {
+function toSarif(result, version = "0.1.2") {
   const rules = /* @__PURE__ */ new Map();
   for (const finding of result.findings) {
     if (rules.has(finding.id)) {
